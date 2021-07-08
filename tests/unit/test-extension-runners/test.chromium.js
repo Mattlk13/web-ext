@@ -1,11 +1,12 @@
 /* @flow */
 
+import path from 'path';
 import EventEmitter from 'events';
 
 import {assert} from 'chai';
-import {describe, it} from 'mocha';
+import {describe, it, beforeEach, afterEach} from 'mocha';
 import deepcopy from 'deepcopy';
-import fs from 'mz/fs';
+import fs from 'fs-extra';
 import sinon from 'sinon';
 import WebSocket from 'ws';
 
@@ -24,6 +25,9 @@ import type {
 import {
   consoleStream, // instance is imported to inspect logged messages
 } from '../../../src/util/logger';
+import { TempDir, withTempDir } from '../../../src/util/temp-dir';
+import fileExists from '../../../src/util/file-exists';
+import isDirectory from '../../../src/util/is-directory';
 
 function prepareExtensionRunnerParams({params} = {}) {
   const fakeChromeInstance = {
@@ -50,13 +54,25 @@ function prepareExtensionRunnerParams({params} = {}) {
 describe('util/extension-runners/chromium', async () => {
 
   it('uses the expected chrome flags', () => {
-    const expectedFlags = [ // Flags from 11.2
-      '--disable-translate',
+    // Flags from chrome-launcher v0.14.0
+    const expectedFlags = [
+      '--disable-features=Translate',
+      '--disable-component-extensions-with-background-pages',
       '--disable-background-networking',
+      '--disable-component-update',
+      '--disable-client-side-phishing-detection',
       '--disable-sync',
       '--metrics-recording-only',
       '--disable-default-apps',
+      '--no-default-browser-check',
       '--no-first-run',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-background-timer-throttling',
+      '--disable-ipc-flooding-protection',
+      '--password-store=basic',
+      '--use-mock-keychain',
+      '--force-fieldtrials=*BackgroundTracing/default/',
     ];
 
     assert.deepEqual(DEFAULT_CHROME_FLAGS, expectedFlags);
@@ -108,6 +124,7 @@ describe('util/extension-runners/chromium', async () => {
     const runnerInstance = new ChromiumExtensionRunner(params);
     await runnerInstance.run();
 
+    // $FlowIgnore: allow to call addess even wss property can be undefined.
     const wssInfo = runnerInstance.wss.address();
     const wsURL = `ws://${wssInfo.address}:${wssInfo.port}`;
     const wsClient = new WebSocket(wsURL);
@@ -125,7 +142,7 @@ describe('util/extension-runners/chromium', async () => {
 
     const fakeSocket = new EventEmitter();
     sinon.spy(fakeSocket, 'on');
-    runnerInstance.wss.emit('connection', fakeSocket);
+    runnerInstance.wss?.emit('connection', fakeSocket);
     sinon.assert.calledOnce(fakeSocket.on);
 
     fakeSocket.emit('error', new Error('Fake wss socket ERROR'));
@@ -140,8 +157,13 @@ describe('util/extension-runners/chromium', async () => {
         message.match('Fake wss socket ERROR')
       )));
 
+    const reload = (client, resolve, data) => {
+      client.send(JSON.stringify({ type: 'webExtReloadExtensionComplete' }));
+      resolve(data);
+    };
+
     const waitForReloadAll = new Promise((resolve) =>
-      wsClient.on('message', resolve));
+      wsClient.on('message', (data) => reload(wsClient, resolve, data)));
     await runnerInstance.reloadAllExtensions();
     assert.deepEqual(JSON.parse(await waitForReloadAll),
                      {type: 'webExtReloadAllExtensions'});
@@ -149,7 +171,7 @@ describe('util/extension-runners/chromium', async () => {
     // TODO(rpl): change this once we improve the manager extension to be able
     // to reload a single extension.
     const waitForReloadOne = new Promise((resolve) =>
-      wsClient.on('message', resolve));
+      wsClient.on('message', (data) => reload(wsClient, resolve, data)));
     await runnerInstance.reloadExtensionBySourceDir('/fake/sourceDir');
     assert.deepEqual(JSON.parse(await waitForReloadOne),
                      {type: 'webExtReloadAllExtensions'});
@@ -160,9 +182,15 @@ describe('util/extension-runners/chromium', async () => {
     await new Promise((resolve) => wsClient2.on('open', resolve));
     wsClient.close();
 
+    const waitForReloadClient2 = new Promise((resolve) =>
+      wsClient2.on('message', (data) => reload(wsClient2, resolve, data)));
+
     await runnerInstance.reloadAllExtensions();
+    assert.deepEqual(JSON.parse(await waitForReloadClient2),
+                     {type: 'webExtReloadAllExtensions'});
+
     const waitForReloadAllAgain = new Promise((resolve) =>
-      wsClient2.on('message', resolve));
+      wsClient2.on('message', (data) => reload(wsClient2, resolve, data)));
     await runnerInstance.reloadAllExtensions();
     assert.deepEqual(JSON.parse(await waitForReloadAllAgain),
                      {type: 'webExtReloadAllExtensions'});
@@ -339,15 +367,232 @@ describe('util/extension-runners/chromium', async () => {
     await runnerInstance.exit();
   });
 
-  it('does pass a user-data-dir flag to chrome', async () => {
+  it('does use a random user-data-dir', async () => {
+
     const {params} = prepareExtensionRunnerParams({
-      params: {
-        chromiumProfile: '/fake/chrome/profile',
-      },
+      params: {},
     });
+
+    const spy = sinon.spy(TempDir.prototype, 'path');
 
     const runnerInstance = new ChromiumExtensionRunner(params);
     await runnerInstance.run();
+
+    const usedTempPath = spy.returnValues[2];
+
+    sinon.assert.calledWithMatch(params.chromiumLaunch, {
+      userDataDir: usedTempPath,
+    });
+
+    await runnerInstance.exit();
+    spy.restore();
+  });
+
+  it('does pass a user-data-dir flag to chrome', async () => withTempDir(
+    async (tmpDir) => {
+
+      const {params} = prepareExtensionRunnerParams({
+        params: {
+          chromiumProfile: tmpDir.path(),
+        },
+      });
+
+      const spy = sinon.spy(TempDir.prototype, 'path');
+
+      const runnerInstance = new ChromiumExtensionRunner(params);
+      await runnerInstance.run();
+
+      const usedTempPath = spy.returnValues[2];
+
+      const {reloadManagerExtension} = runnerInstance;
+
+      sinon.assert.calledOnce(params.chromiumLaunch);
+      sinon.assert.calledWithMatch(params.chromiumLaunch, {
+        ignoreDefaultFlags: true,
+        enableExtensions: true,
+        chromePath: undefined,
+        userDataDir: usedTempPath,
+        chromeFlags: [
+          ...DEFAULT_CHROME_FLAGS,
+          `--load-extension=${reloadManagerExtension},/fake/sourceDir`,
+        ],
+        startingUrl: undefined,
+      });
+
+      await runnerInstance.exit();
+      spy.restore();
+    })
+  );
+
+  it('does pass existing user-data-dir and profile-directory flag' +
+    ' to chrome', async () => withTempDir(
+    async (tmpDir) => {
+      const tmpPath = tmpDir.path();
+      await fs.mkdirs(path.join(tmpPath, 'userDataDir/Default'));
+      await fs.outputFile(path.join(tmpPath, 'userDataDir/Local State'), '');
+      await fs.mkdirs(path.join(tmpPath, 'userDataDir/profile'));
+      await fs.outputFile(path.join(
+        tmpPath, 'userDataDir/profile/Secure Preferences'), '');
+
+      const {params} = prepareExtensionRunnerParams({
+        params: {
+          chromiumProfile: path.join(tmpPath, 'userDataDir/profile'),
+          keepProfileChanges: true,
+        },
+      });
+
+      const runnerInstance = new ChromiumExtensionRunner(params);
+      await runnerInstance.run();
+
+      const {reloadManagerExtension} = runnerInstance;
+
+      sinon.assert.calledOnce(params.chromiumLaunch);
+      sinon.assert.calledWithMatch(params.chromiumLaunch, {
+        ignoreDefaultFlags: true,
+        enableExtensions: true,
+        chromePath: undefined,
+        userDataDir: path.join(tmpPath, 'userDataDir'),
+        chromeFlags: [
+          ...DEFAULT_CHROME_FLAGS,
+          `--load-extension=${reloadManagerExtension},/fake/sourceDir`,
+          '--profile-directory=profile',
+        ],
+        startingUrl: undefined,
+      });
+
+      await runnerInstance.exit();
+
+    })
+  );
+
+  it('does support some special chars in profile-directory flag',
+     async () => withTempDir(
+       async (tmpDir) => {
+         const tmpPath = tmpDir.path();
+         // supported to test: [ _-]
+         // not supported by Chromium: [ßäé]
+         const profileDirName = ' profile _-\' ';
+         await fs.mkdirs(path.join(tmpPath, 'userDataDir/Default'));
+         await fs.outputFile(path.join(tmpPath, 'userDataDir/Local State'), '');
+         await fs.mkdirs(path.join(tmpPath, 'userDataDir', profileDirName));
+         await fs.outputFile(path.join(
+           tmpPath, 'userDataDir', profileDirName, 'Secure Preferences'), '');
+
+         const {params} = prepareExtensionRunnerParams({
+           params: {
+             chromiumProfile: path.join(tmpPath, 'userDataDir', profileDirName),
+             keepProfileChanges: true,
+           },
+         });
+
+         const runnerInstance = new ChromiumExtensionRunner(params);
+         await runnerInstance.run();
+
+         const {reloadManagerExtension} = runnerInstance;
+
+         sinon.assert.calledOnce(params.chromiumLaunch);
+         sinon.assert.calledWithMatch(params.chromiumLaunch, {
+           ignoreDefaultFlags: true,
+           enableExtensions: true,
+           chromePath: undefined,
+           userDataDir: path.join(tmpPath, 'userDataDir'),
+           chromeFlags: [
+             ...DEFAULT_CHROME_FLAGS,
+             `--load-extension=${reloadManagerExtension},/fake/sourceDir`,
+             `--profile-directory=${profileDirName}`,
+           ],
+           startingUrl: undefined,
+         });
+
+         await runnerInstance.exit();
+
+       })
+  );
+
+  it('does recognize a UserData dir', async () => withTempDir(
+    async (tmpDir) => {
+
+      const tmpPath = tmpDir.path();
+      await fs.mkdirs(path.join(tmpPath, 'Default'));
+      await fs.outputFile(path.join(tmpPath, 'Local State'), '');
+
+      assert.isTrue(await ChromiumExtensionRunner.isUserDataDir(tmpPath));
+
+    }),
+  );
+
+  it('does reject a UserData dir with Local State dir', async () => withTempDir(
+    async (tmpDir) => {
+
+      const tmpPath = tmpDir.path();
+      await fs.mkdirs(path.join(tmpPath, 'Default'));
+      // Local State should be a file
+      await fs.mkdirs(path.join(tmpPath, 'Local State'));
+
+      assert.isFalse(await ChromiumExtensionRunner.isUserDataDir(tmpPath));
+
+    }),
+  );
+
+  it('does reject a UserData dir with Default file', async () => withTempDir(
+    async (tmpDir) => {
+
+      const tmpPath = tmpDir.path();
+      await fs.mkdirs(path.join(tmpPath, 'Local State'));
+      // Default should be a directory
+      await fs.outputFile(path.join(tmpPath, 'Default'), '');
+
+      assert.isFalse(await ChromiumExtensionRunner.isUserDataDir(tmpPath));
+
+    }),
+  );
+
+  it('throws an error on profile in invalid user-data-dir',
+     async () => withTempDir(async (tmpDir) => {
+       const tmpPath = tmpDir.path();
+       await fs.mkdirs(
+         path.join(tmpPath, 'userDataDir/profile'));
+       // the userDataDir is missing a file Local State to be validated as such
+       await fs.outputFile(path.join(
+         tmpPath, 'userDataDir/profile/Secure Preferences'), '');
+
+       const {params} = prepareExtensionRunnerParams({
+         params: {
+           chromiumProfile: path.join(tmpPath, 'userDataDir/profile'),
+           keepProfileChanges: true,
+         },
+       });
+
+       const runnerInstance = new ChromiumExtensionRunner(params);
+
+       await assert.isRejected(runnerInstance.run(), /not in a user-data-dir/);
+
+       await runnerInstance.exit();
+
+     })
+  );
+
+  it('does copy the profile and pass user-data-dir and profile-directory' +
+    ' flags', async () => withTempDir(async (tmpDir) => {
+
+    const tmpPath = tmpDir.path();
+    await fs.mkdirs(
+      path.join(tmpPath, 'userDataDir/profile'));
+    await fs.outputFile(path.join(
+      tmpPath, 'userDataDir/profile/Secure Preferences'), '');
+
+    const {params} = prepareExtensionRunnerParams({
+      params: {
+        chromiumProfile: path.join(tmpPath, 'userDataDir/profile'),
+      },
+    });
+
+    const spy = sinon.spy(TempDir.prototype, 'path');
+
+    const runnerInstance = new ChromiumExtensionRunner(params);
+    await runnerInstance.run();
+
+    const usedTempPath = spy.returnValues[2];
 
     const {reloadManagerExtension} = runnerInstance;
 
@@ -356,15 +601,101 @@ describe('util/extension-runners/chromium', async () => {
       ignoreDefaultFlags: true,
       enableExtensions: true,
       chromePath: undefined,
+      userDataDir: usedTempPath,
       chromeFlags: [
         ...DEFAULT_CHROME_FLAGS,
         `--load-extension=${reloadManagerExtension},/fake/sourceDir`,
-        '--user-data-dir=/fake/chrome/profile',
+        '--profile-directory=profile',
       ],
       startingUrl: undefined,
     });
 
-    await runnerInstance.exit();
-  });
+    assert.isTrue(await isDirectory(path.join(usedTempPath, 'profile')));
+    assert.isTrue(await fileExists(path.join(
+      usedTempPath, 'profile/Secure Preferences')));
 
+    await runnerInstance.exit();
+    spy.restore();
+  })
+  );
+
+  describe('reloadAllExtensions', () => {
+    let runnerInstance: ChromiumExtensionRunner;
+    let wsClient: WebSocket;
+
+    beforeEach(async () => {
+      const {params} = prepareExtensionRunnerParams();
+      runnerInstance = new ChromiumExtensionRunner(params);
+      await runnerInstance.run();
+    });
+
+    const connectClient = async () => {
+      if (!runnerInstance.wss) {
+        throw new Error('WebSocker server is not running');
+      }
+      // $FlowIgnore: if runnerInstance.wss would be unexpectedly undefined the test case will fail.
+      const wssInfo = runnerInstance.wss.address();
+      const wsURL = `ws://${wssInfo.address}:${wssInfo.port}`;
+      wsClient = new WebSocket(wsURL);
+      await new Promise((resolve) => wsClient.on('open', resolve));
+    };
+
+    afterEach(async () => {
+      if (wsClient && (wsClient.readyState === WebSocket.OPEN)) {
+        wsClient.close();
+        // $FlowIgnore: allow to nullify wsClient even if wsClient signature doesn't allow it.
+        wsClient = null;
+      }
+      await runnerInstance.exit();
+    });
+
+    it('does not resolve before complete message from client', async () => {
+      let reloadMessage = false;
+      await connectClient();
+
+      wsClient.on('message', (message) => {
+        const msg = JSON.parse(message);
+
+        if (msg.type === 'webExtReloadAllExtensions') {
+          assert.equal(reloadMessage, false);
+
+          setTimeout(() => {
+            const respondMsg = JSON.stringify({
+              type: 'webExtReloadExtensionComplete',
+            });
+            wsClient.send(respondMsg);
+            reloadMessage = true;
+          }, 333);
+        }
+      });
+
+      await runnerInstance.reloadAllExtensions();
+      assert.equal(reloadMessage, true);
+    });
+
+    it('resolve when any client send complete message', async () => {
+      await connectClient();
+      wsClient.on('message', () => {
+        const msg = JSON.stringify({type: 'webExtReloadExtensionComplete'});
+        wsClient.send(msg);
+      });
+      await runnerInstance.reloadAllExtensions();
+    });
+
+    it('resolve when all client disconnect', async () => {
+      await connectClient();
+      await new Promise((resolve) => {
+        wsClient.on('close', () => {
+          resolve(runnerInstance.reloadAllExtensions());
+        });
+        wsClient.close();
+      });
+      // $FlowIgnore: allow to nullify wsClient even if wsClient signature doesn't allow it.
+      wsClient = null;
+    });
+
+    it('resolve when not client connected', async () => {
+      await runnerInstance.reloadAllExtensions();
+    });
+  });
 });

@@ -6,6 +6,7 @@ import sinon from 'sinon';
 import webExt from '../../src/main';
 import {main} from '../../src/program';
 import {consoleStream} from '../../src/util/logger';
+import {listADBDevices, listADBFirefoxAPKs} from '../../src/util/adb';
 
 
 describe('webExt', () => {
@@ -17,8 +18,18 @@ describe('webExt', () => {
     assert.equal(webExt.util.logger.consoleStream, consoleStream);
   });
 
+  describe('exposes adb utils', () => {
+    it('gives access to listADBDevices', () => {
+      assert.equal(webExt.util.adb.listADBDevices, listADBDevices);
+    });
+
+    it('gives access to listADBFirefoxAPKs', () => {
+      assert.equal(webExt.util.adb.listADBFirefoxAPKs, listADBFirefoxAPKs);
+    });
+  });
+
   describe('exposes commands', () => {
-    let stub: sinon.Stub;
+    let stub: any;
     afterEach(() => {
       stub.restore();
       stub = undefined;
@@ -26,7 +37,7 @@ describe('webExt', () => {
     for (const cmd of ['run', 'lint', 'build', 'sign', 'docs']) {
       it(`lazily loads cmd/${cmd}`, async () => {
         // TODO: use async import instead of require - https://github.com/mozilla/web-ext/issues/1306
-        // $FLOW_IGNORE: non-literal require used only in tests.
+        // $FlowIgnore: non-literal require used only in tests.
         const cmdModule = require(`../../src/cmd/${cmd}`);
         stub = sinon.stub(cmdModule, 'default');
 

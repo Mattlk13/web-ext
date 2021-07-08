@@ -1,7 +1,9 @@
 /* @flow */
+import {fs} from 'mz';
 import Watchpack from 'watchpack';
 import debounce from 'debounce';
 
+import { UsageError } from './errors';
 import {createLogger} from './util/logger';
 
 
@@ -16,9 +18,12 @@ export type OnChangeFn = () => any;
 
 export type OnSourceChangeParams = {|
   sourceDir: string,
+  watchFile?: Array<string>,
+  watchIgnored?: Array<string>,
   artifactsDir: string,
   onChange: OnChangeFn,
   shouldWatchFile: ShouldWatchFn,
+  debounceTime?: number,
 |};
 
 // NOTE: this fix an issue with flow and default exports (which currently
@@ -30,20 +35,61 @@ declare function exports(params: OnSourceChangeParams): Watchpack;
 export type OnSourceChangeFn = (params: OnSourceChangeParams) => Watchpack;
 
 export default function onSourceChange(
-  {sourceDir, artifactsDir, onChange, shouldWatchFile}: OnSourceChangeParams
+  {
+    sourceDir,
+    watchFile,
+    watchIgnored,
+    artifactsDir,
+    onChange,
+    shouldWatchFile,
+    debounceTime = 1000,
+  }: OnSourceChangeParams
 ): Watchpack {
+  // When running on Windows, transform the ignored paths and globs
+  // as Watchpack does translate the changed files path internally
+  // (See https://github.com/webpack/watchpack/blob/v2.1.1/lib/DirectoryWatcher.js#L99-L103).
+  const ignored = (watchIgnored && process.platform === 'win32')
+    ? watchIgnored.map((it) => it.replace(/\\/g, '/'))
+    : watchIgnored;
+
   // TODO: For network disks, we would need to add {poll: true}.
-  const watcher = new Watchpack();
+  const watcher = ignored ?
+    new Watchpack({ignored}) :
+    new Watchpack();
 
   const executeImmediately = true;
-  onChange = debounce(onChange, 1000, executeImmediately);
+  onChange = debounce(onChange, debounceTime, executeImmediately);
 
   watcher.on('change', (filePath) => {
     proxyFileChanges({artifactsDir, onChange, filePath, shouldWatchFile});
   });
 
-  log.debug(`Watching for file changes in ${sourceDir}`);
-  watcher.watch([], [sourceDir], Date.now());
+  log.debug(
+    `Watching ${watchFile ? watchFile.join(',') : sourceDir} for changes`
+  );
+
+  const watchedDirs = [];
+  const watchedFiles = [];
+
+  if (watchFile) {
+    for (const filePath of watchFile) {
+      if (fs.existsSync(filePath) && !fs.lstatSync(filePath).isFile()) {
+        throw new UsageError('Invalid --watch-file value: ' +
+          `"${filePath}" is not a file.`);
+      }
+
+      watchedFiles.push(filePath);
+    }
+  } else {
+    watchedDirs.push(sourceDir);
+  }
+
+  watcher.watch({
+    files: watchedFiles,
+    directories: watchedDirs,
+    missing: [],
+    startTime: Date.now(),
+  });
 
   // TODO: support interrupting the watcher on Windows.
   // https://github.com/mozilla/web-ext/issues/225

@@ -1,15 +1,5 @@
 module.exports = {
   clean: ['dist/*'],
-  copy: {
-    productionModeAssets: {
-      src: [
-        'package.json',
-        'package-lock.json',
-        'dist/**',
-        'bin/**',
-      ],
-    },
-  },
   watch: {
     files: [
       'package.json',
@@ -24,7 +14,7 @@ module.exports = {
   },
   eslint: {
     files: [
-      '.', './src/**/*.js', './tests/**/*.js', './scripts/**',
+      '.', './index.mjs', './src/**/*.js', './tests/**/*.js', './scripts/**',
     ],
   },
   mocha: {

@@ -8,7 +8,12 @@ import sinon, {spy} from 'sinon';
 import {assert} from 'chai';
 
 import {applyConfigToArgv} from '../../src/config';
-import {defaultVersionGetter, main, Program} from '../../src/program';
+import {
+  defaultVersionGetter,
+  main,
+  Program,
+  throwUsageErrorIfArray,
+} from '../../src/program';
 import commands from '../../src/cmd';
 import {
   onlyInstancesOf,
@@ -317,6 +322,60 @@ describe('program.Program', () => {
         sinon.assert.notCalled(checkForUpdates);
       });
   });
+
+  it('does remove environment vars unsupported by the selected command',
+     async () => {
+       const handlerRun = spy();
+       const handlerSpy = spy();
+       const program = new Program(['run', '--another-run-option=from-cli']);
+       const fakeEnv = {
+         WEB_EXT_RUN_OPTION: 'from-env',
+         WEB_EXT_VERBOSE: 'true',
+         WEB_EXT_SIGN_OPTION: 'from-env',
+         // Also include some environment vars that miss the '_' separator
+         // between envPrefix and option name.
+         WEB_EXTANOTHER_RUN_OPTION: 'from-env',
+         WEB_EXTANOTHER_SIGN_OPTION: 'from-env',
+       };
+       program.setGlobalOptions({
+         verbose: {
+           type: 'boolean',
+           demandOption: false,
+           default: false,
+         },
+       });
+       program.command('run', 'some command', handlerRun, {
+         'run-option': {
+           demandOption: true,
+           type: 'string',
+         },
+         'another-run-option': {
+           demandOption: true,
+           default: 'from-default',
+           type: 'string',
+         },
+       });
+       program.command('sign', 'another command', handlerSpy, {
+         'sign-option': {
+           demandOption: true,
+           default: 'from-default',
+           type: 'string',
+         },
+         'another-sign-option': {
+           demandOption: true,
+           default: 'from-default',
+           type: 'string',
+         },
+       });
+
+       // $FlowIgnore: override systemProcess for testing purpose.
+       program.cleanupProcessEnvConfigs({env: fakeEnv});
+       assert.deepEqual(fakeEnv, {
+         WEB_EXT_RUN_OPTION: 'from-env',
+         WEB_EXTANOTHER_RUN_OPTION: 'from-env',
+         WEB_EXT_VERBOSE: 'true',
+       });
+     });
 });
 
 
@@ -443,19 +502,30 @@ describe('program.main', () => {
       });
   });
 
-  it('passes the url of a firefox binary when specified', () => {
+  it('passes the url of a firefox binary when specified', async () => {
     const fakeCommands = fake(commands, {
       run: () => Promise.resolve(),
     });
-    return execProgram(
-      ['run', '--start-url', 'www.example.com'],
-      {commands: fakeCommands})
-      .then(() => {
-        sinon.assert.calledWithMatch(
-          fakeCommands.run,
-          {startUrl: ['www.example.com']}
-        );
-      });
+    const opts = {commands: fakeCommands};
+
+    await execProgram(['run', '--start-url', 'www.example.com'], opts);
+    sinon.assert.calledWithMatch(fakeCommands.run, {
+      startUrl: ['www.example.com'],
+    });
+
+    // Repeat test with multiple urls.
+    await execProgram(
+      ['run', '--start-url', 'www.example.com', 'www.example2.com'],
+      opts
+    );
+    sinon.assert.calledWithMatch(fakeCommands.run, {
+      startUrl: ['www.example.com', 'www.example2.com'],
+    });
+
+    await assert.isRejected(
+      execProgram(['run', '--start-url'], opts),
+      /Not enough arguments following: start-url/
+    );
   });
 
   it('opens browser console when --browser-console is specified', () => {
@@ -471,6 +541,58 @@ describe('program.main', () => {
           {browserConsole: true}
         );
       });
+  });
+
+  async function testWatchFileOption(watchFile) {
+    const fakeCommands = fake(commands, {
+      run: () => Promise.resolve(),
+    });
+
+    return execProgram(
+      ['run', '--watch-file', ...watchFile],
+      {commands: fakeCommands})
+      .then(() => {
+        sinon.assert.calledWithMatch(
+          fakeCommands.run,
+          {watchFile}
+        );
+      });
+  }
+
+  it('calls run with a watched file', () => {
+    testWatchFileOption(['path/to/fake/file.txt']);
+  });
+
+  it('calls run with multiple watched files', () => {
+    testWatchFileOption(
+      ['path/to/fake/file.txt', 'path/to/fake/file2.txt']
+    );
+  });
+
+  async function testWatchIgnoredOption(watchIgnored) {
+    const fakeCommands = fake(commands, {
+      run: () => Promise.resolve(),
+    });
+
+    await execProgram(
+      ['run', '--watch-ignored', ...watchIgnored],
+      {commands: fakeCommands});
+
+    sinon.assert.calledWithMatch(
+      execProgram,
+      fakeCommands.run,
+      {watchIgnored}
+    );
+  }
+
+  it('calls run with a single watchIgnored pattern', () => {
+    testWatchIgnoredOption(['path/to/fake/file1.txt']);
+  });
+
+  it('calls run with a multiple watchIgnored patterns', () => {
+    testWatchIgnoredOption(
+      ['path/to/fake/file1.txt', 'path/to/fake/pattern*']
+    );
   });
 
   it('converts custom preferences into an object', () => {
@@ -733,6 +855,54 @@ describe('program.main', () => {
         assert.equal(options.artifactsDir, 'xxx');
       });
   });
+
+  it(
+    'does pass a custom apk component with --firefox-apk-component',
+    async () => {
+      const fakeCommands = fake(commands, {
+        build: () => Promise.resolve(),
+      });
+      await execProgram(
+        [
+          'run',
+          '--firefox-apk-component', 'CustomView',
+          '-t', 'firefox-android',
+        ],
+        {commands: fakeCommands}
+      );
+      const options = fakeCommands.run.firstCall.args[0];
+      assert.equal(options.firefoxApkComponent, 'CustomView');
+    }
+  );
+
+  describe('--no-input', () => {
+    const fakeCommands = fake(commands, {
+      run: () => Promise.resolve(),
+    });
+
+    const testCases = [
+      ['--no-input', {noInput: true}],
+      ['--no-input=false', {noInput: false}],
+      ['--no-input=true', {noInput: true}],
+      ['--input', {noInput: false}],
+      ['--input=false', {noInput: true}],
+      ['--input=true', {noInput: false}],
+      ['-v', {noInput: undefined}],
+    ];
+
+    for (const [cliArg, expected] of testCases) {
+      it(`does parse "${cliArg}" cli argument as ${JSON.stringify(expected)}`,
+         async () => {
+           await execProgram(['run', cliArg], {commands: fakeCommands});
+           sinon.assert.calledWithMatch(
+             fakeCommands.run,
+             expected
+           );
+           fakeCommands.run.resetHistory();
+         });
+    }
+  });
+
 });
 
 describe('program.defaultVersionGetter', () => {
@@ -749,9 +919,23 @@ describe('program.defaultVersionGetter', () => {
   });
 
   it('returns git commit information in development', function() {
-    const commit = `${git.branch()}-${git.long()}`;
-    const testBuildEnv = {globalEnv: 'development'};
-    assert.equal(defaultVersionGetter(projectRoot, testBuildEnv),
-                 commit);
+    return fs.exists(path.join(projectRoot, '.git')).then((exists) => {
+      if (!exists) {
+        this.skip();
+      }
+      const commit = `${git.branch()}-${git.long()}`;
+      const testBuildEnv = {globalEnv: 'development'};
+      assert.equal(defaultVersionGetter(projectRoot, testBuildEnv),
+                   commit);
+    });
+  });
+});
+
+describe('program.throwUsageErrorIfArray', () => {
+  const errorMessage = 'This is the expected error message';
+  const innerFn = throwUsageErrorIfArray(errorMessage);
+
+  it('throws UsageError on array', () => {
+    assert.throws(() => innerFn(['foo', 'bar']), UsageError, errorMessage);
   });
 });

@@ -1,5 +1,5 @@
 /* @flow */
-import defaultADB from 'adbkit';
+import defaultADB from '@devicefarmer/adbkit';
 
 import {
   isErrorWithCode,
@@ -7,6 +7,12 @@ import {
   WebExtError,
 } from '../errors';
 import {createLogger} from '../util/logger';
+import packageIdentifiers, {
+  defaultApkComponents,
+} from '../firefox/package-identifiers';
+
+export const DEVICE_DIR_BASE = '/data/local/tmp/';
+export const ARTIFACTS_DIR_PREFIX = 'web-ext-artifacts-';
 
 const log = createLogger(__filename);
 
@@ -116,10 +122,13 @@ export default class ADBUtils {
           return line === firefoxApk;
         }
         // Match any package name that starts with the package name of a Firefox for Android browser.
-        return (
-          line.startsWith('org.mozilla.fennec') ||
-            line.startsWith('org.mozilla.firefox')
-        );
+        for (const browser of packageIdentifiers) {
+          if (line.startsWith(browser)) {
+            return true;
+          }
+        }
+
+        return false;
       });
   }
 
@@ -192,7 +201,7 @@ export default class ADBUtils {
       return artifactsDir;
     }
 
-    artifactsDir = `/sdcard/web-ext-artifacts-${Date.now()}`;
+    artifactsDir = `${DEVICE_DIR_BASE}${ARTIFACTS_DIR_PREFIX}${Date.now()}`;
 
     const testDirOut = (await this.runShellCommand(
       deviceId, `test -d ${artifactsDir} ; echo $?`
@@ -212,6 +221,44 @@ export default class ADBUtils {
     return artifactsDir;
   }
 
+  async detectOrRemoveOldArtifacts(
+    deviceId: string, removeArtifactDirs?: boolean = false
+  ): Promise<boolean> {
+    const {adbClient} = this;
+
+    log.debug('Checking adb device for existing web-ext artifacts dirs');
+
+    return wrapADBCall(async () => {
+      const files = await adbClient.readdir(deviceId, DEVICE_DIR_BASE);
+      let found = false;
+
+      for (const file of files) {
+        if (!file.isDirectory() ||
+            !file.name.startsWith(ARTIFACTS_DIR_PREFIX)) {
+          continue;
+        }
+
+        // Return earlier if we only need to warn the user that some
+        // existing artifacts dirs have been found on the adb device.
+        if (!removeArtifactDirs) {
+          return true;
+        }
+
+        found = true;
+
+        const artifactsDir = `${DEVICE_DIR_BASE}${file.name}`;
+
+        log.debug(
+          `Removing artifacts directory ${artifactsDir} from device ${deviceId}`
+        );
+
+        await this.runShellCommand(deviceId, ['rm', '-rf', artifactsDir]);
+      }
+
+      return found;
+    });
+  }
+
   async clearArtifactsDir(deviceId: string): Promise<void> {
     const artifactsDir = this.artifactsDirMap.get(deviceId);
 
@@ -226,9 +273,7 @@ export default class ADBUtils {
       `Removing ${artifactsDir} artifacts directory on ${deviceId} device`
     );
 
-    await this.runShellCommand(deviceId, [
-      'rm', '-rf', artifactsDir,
-    ]);
+    await this.runShellCommand(deviceId, ['rm', '-rf', artifactsDir]);
   }
 
   async pushFile(
@@ -249,25 +294,55 @@ export default class ADBUtils {
   }
 
   async startFirefoxAPK(
-    deviceId: string, apk: string, deviceProfileDir: string
+    deviceId: string,
+    apk: string,
+    apkComponent: ?string,
+    deviceProfileDir: string,
   ): Promise<void> {
     const {adbClient} = this;
 
     log.debug(
-      `Starting ${apk} with profile ${deviceProfileDir} on ${deviceId}`
+      `Starting ${apk} on ${deviceId}`
     );
+
+    // Fenix does ignore the -profile parameter, on the contrary Fennec
+    // would run using the given path as the profile to be used during
+    // this execution.
+    const extras = [{
+      key: 'args',
+      value: `-profile ${deviceProfileDir}`,
+    }];
+
+    if (!apkComponent) {
+      apkComponent = '.App';
+      if (defaultApkComponents[apk]) {
+        apkComponent = defaultApkComponents[apk];
+      }
+    } else if (!apkComponent.includes('.')) {
+      apkComponent = `.${apkComponent}`;
+    }
+
+    // if `apk` is a browser package or the `apk` has a
+    // browser package prefix: prepend the package identifier
+    // before `apkComponent`
+    if (apkComponent.startsWith('.')) {
+      for (const browser of packageIdentifiers) {
+        if (apk === browser || apk.startsWith(`${browser}.`)) {
+          apkComponent = browser + apkComponent;
+        }
+      }
+    }
+
+    // if `apkComponent` starts with a '.', then adb will expand
+    // the following to: `${apk}/${apk}.${apkComponent}`
+    const component = `${apk}/${apkComponent}`;
 
     await wrapADBCall(async () => {
       await adbClient.startActivity(deviceId, {
         wait: true,
         action: 'android.activity.MAIN',
-        component: `${apk}/.App`,
-        extras: [
-          {
-            key: 'args',
-            value: `-profile ${deviceProfileDir}`,
-          },
-        ],
+        component,
+        extras,
       });
     });
   }
@@ -283,8 +358,14 @@ export default class ADBUtils {
     let rdpUnixSockets = [];
 
     const discoveryStartedAt = Date.now();
+    const msg = (
+      `Waiting for ${apk} Remote Debugging Server...` +
+      '\nMake sure to enable "Remote Debugging via USB" ' +
+      'from Settings -> Developer Tools if it is not yet enabled.'
+    );
 
     while (rdpUnixSockets.length === 0) {
+      log.info(msg);
       if (this.userAbortDiscovery) {
         throw new UsageError(
           'Exiting Firefox Remote Debugging socket discovery on user request'
@@ -336,4 +417,17 @@ export default class ADBUtils {
       await adbClient.forward(deviceId, local, remote);
     });
   }
+}
+
+export async function listADBDevices(adbBin?: string): Promise<Array<string>> {
+  const adbClient = new ADBUtils({adbBin});
+  return adbClient.discoverDevices();
+}
+
+export async function listADBFirefoxAPKs(
+  deviceId: string,
+  adbBin?: string
+): Promise<Array<string>> {
+  const adbClient = new ADBUtils({adbBin});
+  return adbClient.discoverInstalledFirefoxAPKs(deviceId);
 }

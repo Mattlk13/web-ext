@@ -6,14 +6,12 @@
  */
 
 import path from 'path';
-import {promisify} from 'util';
 
-import {fs} from 'mz';
-import mkdirp from 'mkdirp';
+import fs from 'fs-extra';
+import asyncMkdirp from 'mkdirp';
 import {
-  LaunchedChrome,
+  Launcher as ChromeLauncher,
   launch as defaultChromiumLaunch,
-  default as ChromeLauncher,
 } from 'chrome-launcher';
 import WebSocket from 'ws';
 
@@ -23,6 +21,8 @@ import type {
   ExtensionRunnerParams,
   ExtensionRunnerReloadResult,
 } from './base';
+import isDirectory from '../util/is-directory';
+import fileExists from '../util/file-exists';
 
 type ChromiumSpecificRunnerParams = {|
    chromiumBinary?: string,
@@ -38,14 +38,12 @@ export type ChromiumExtensionRunnerParams = {|
 
 const log = createLogger(__filename);
 
-const asyncMkdirp = promisify(mkdirp);
-
 const EXCLUDED_CHROME_FLAGS = [
   '--disable-extensions',
   '--mute-audio',
 ];
 
-export const DEFAULT_CHROME_FLAGS = ChromeLauncher.defaultFlags()
+export const DEFAULT_CHROME_FLAGS: Array<string> = ChromeLauncher.defaultFlags()
   .filter((flag) => !EXCLUDED_CHROME_FLAGS.includes(flag));
 
 /**
@@ -54,10 +52,10 @@ export const DEFAULT_CHROME_FLAGS = ChromeLauncher.defaultFlags()
 export class ChromiumExtensionRunner {
   cleanupCallbacks: Set<Function>;
   params: ChromiumExtensionRunnerParams;
-  chromiumInstance: LaunchedChrome;
+  chromiumInstance: ?ChromeLauncher;
   chromiumLaunch: typeof defaultChromiumLaunch;
   reloadManagerExtension: string;
-  wss: WebSocket.Server;
+  wss: ?WebSocket.Server;
   exiting: boolean;
   _promiseSetupDone: ?Promise<void>;
 
@@ -75,7 +73,7 @@ export class ChromiumExtensionRunner {
   /**
    * Returns the runner name.
    */
-  getName() {
+  getName(): string {
     return 'Chromium';
   }
 
@@ -85,14 +83,63 @@ export class ChromiumExtensionRunner {
     await this._promiseSetupDone;
   }
 
+  static async isUserDataDir(dirPath: string): Promise<boolean> {
+    const localStatePath = path.join(dirPath, 'Local State');
+    const defaultPath = path.join(dirPath, 'Default');
+    // Local State and Default are typical for the user-data-dir
+    return await fileExists(localStatePath)
+      && await isDirectory(defaultPath);
+  }
+
+  static async isProfileDir(dirPath: string): Promise<boolean> {
+    const securePreferencesPath = path.join(
+      dirPath, 'Secure Preferences');
+    //Secure Preferences is typical for a profile dir inside a user data dir
+    return await fileExists(securePreferencesPath);
+  }
+
+  static async getProfilePaths(chromiumProfile: ?string): Promise<{
+    userDataDir: ?string,
+    profileDirName: ?string
+  }> {
+    if (!chromiumProfile) {
+      return {
+        userDataDir: null,
+        profileDirName: null,
+      };
+    }
+
+    const isProfileDirAndNotUserData =
+      await ChromiumExtensionRunner.isProfileDir(chromiumProfile)
+      && !await ChromiumExtensionRunner.isUserDataDir(chromiumProfile);
+
+    if (isProfileDirAndNotUserData) {
+      const {dir: userDataDir, base: profileDirName} =
+        path.parse(chromiumProfile);
+      return {
+        userDataDir,
+        profileDirName,
+      };
+    }
+
+    return {
+      userDataDir: chromiumProfile,
+      profileDirName: null,
+    };
+
+  }
+
   /**
    * Setup the Chromium Profile and run a Chromium instance.
    */
   async setupInstance(): Promise<void> {
     // Start a websocket server on a free localhost TCP port.
-    this.wss = new WebSocket.Server({
-      port: 0,
-      host: 'localhost',
+    this.wss = await new Promise((resolve) => {
+      const server = new WebSocket.Server(
+        {port: 0, host: 'localhost'},
+        // Wait the server to be listening (so that the extension
+        // runner can successfully retrieve server address and port).
+        () => resolve(server));
     });
 
     // Prevent unhandled socket error (e.g. when chrome
@@ -127,8 +174,43 @@ export class ChromiumExtensionRunner {
       chromeFlags.push(...this.params.args);
     }
 
-    if (this.params.chromiumProfile) {
-      chromeFlags.push(`--user-data-dir=${this.params.chromiumProfile}`);
+    // eslint-disable-next-line prefer-const
+    let {userDataDir, profileDirName} =
+      await ChromiumExtensionRunner.getProfilePaths(
+        this.params.chromiumProfile);
+
+    if (userDataDir && this.params.keepProfileChanges) {
+      if (profileDirName
+        && !await ChromiumExtensionRunner.isUserDataDir(userDataDir)) {
+        throw new Error('The profile you provided is not in a ' +
+          'user-data-dir. The changes cannot be kept. Please either ' +
+          'remove --keep-profile-changes or use a profile in a ' +
+          'user-data-dir directory');
+      }
+    } else if (!this.params.keepProfileChanges) {
+      // the user provided an existing profile directory but doesn't want
+      // the changes to be kept. we copy this directory to a temporary
+      // user data dir.
+      const tmpDir = new TempDir();
+      await tmpDir.create();
+      const tmpDirPath = tmpDir.path();
+
+      if (userDataDir && profileDirName) {
+        // copy profile dir to this temp user data dir.
+        await fs.copy(path.join(
+          userDataDir,
+          profileDirName), path.join(
+          tmpDirPath,
+          profileDirName),
+        );
+      } else if (userDataDir) {
+        await fs.copy(userDataDir, tmpDirPath);
+      }
+      userDataDir = tmpDirPath;
+    }
+
+    if (profileDirName) {
+      chromeFlags.push(`--profile-directory=${profileDirName}`);
     }
 
     let startingUrl;
@@ -144,6 +226,7 @@ export class ChromiumExtensionRunner {
       chromePath: chromiumBinary,
       chromeFlags,
       startingUrl,
+      userDataDir,
       // Ignore default flags to keep the extension enabled.
       ignoreDefaultFlags: true,
     });
@@ -158,15 +241,46 @@ export class ChromiumExtensionRunner {
     });
   }
 
-  wssBroadcast(data: Object) {
-    for (const client of this.wss.clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify(data));
+  async wssBroadcast(data: Object): Promise<void> {
+    return new Promise((resolve) => {
+      const clients = this.wss ? new Set(this.wss.clients) : new Set();
+
+      function cleanWebExtReloadComplete() {
+        const client = this;
+        client.removeEventListener('message', webExtReloadComplete);
+        client.removeEventListener('close', cleanWebExtReloadComplete);
+        clients.delete(client);
       }
-    }
+
+      const webExtReloadComplete = async (message) => {
+        const msg = JSON.parse(message.data);
+
+        if (msg.type === 'webExtReloadExtensionComplete') {
+          for (const client of clients) {
+            cleanWebExtReloadComplete.call(client);
+          }
+          resolve();
+        }
+      };
+
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.addEventListener('message', webExtReloadComplete);
+          client.addEventListener('close', cleanWebExtReloadComplete);
+
+          client.send(JSON.stringify(data));
+        } else {
+          clients.delete(client);
+        }
+      }
+
+      if (clients.size === 0) {
+        resolve();
+      }
+    });
   }
 
-  async createReloadManagerExtension() {
+  async createReloadManagerExtension(): Promise<string> {
     const tmpDir = new TempDir();
     await tmpDir.create();
     this.registerCleanup(() => tmpDir.remove());
@@ -193,6 +307,7 @@ export class ChromiumExtensionRunner {
       })
     );
 
+    // $FlowIgnore: this method is only called right after creating the server and so wss should be defined.
     const wssInfo = this.wss.address();
 
     const bgPage = `(function bgPage() {
@@ -223,9 +338,8 @@ export class ChromiumExtensionRunner {
         const msg = JSON.parse(evt.data);
         if (msg.type === 'webExtReloadAllExtensions') {
           const devExtensions = await getAllDevExtensions();
-          for (var ext of devExtensions) {
-            reloadExtension(ext.id);
-          }
+          await Promise.all(devExtensions.map(ext => reloadExtension(ext.id)));
+          ws.send(JSON.stringify({ type: 'webExtReloadExtensionComplete' }));
         }
       };
     })()`;
@@ -241,9 +355,7 @@ export class ChromiumExtensionRunner {
   async reloadAllExtensions(): Promise<Array<ExtensionRunnerReloadResult>> {
     const runnerName = this.getName();
 
-    // TODO(rpl): wait for the wssBroadcast to be processed by the connected
-    // client (https://github.com/mozilla/web-ext/issues/1686).
-    this.wssBroadcast({
+    await this.wssBroadcast({
       type: 'webExtReloadAllExtensions',
     });
 
@@ -297,7 +409,8 @@ export class ChromiumExtensionRunner {
     }
 
     if (this.wss) {
-      await new Promise((resolve) => this.wss.close(resolve));
+      await new Promise((resolve) =>
+        this.wss ? this.wss.close(resolve) : resolve());
       this.wss = null;
     }
 

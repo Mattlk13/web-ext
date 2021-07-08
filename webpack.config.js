@@ -2,23 +2,17 @@
 var path = require('path');
 
 var webpack = require('webpack');
-
-var nodeModules = {};
-
 // Do not bundle any external module, because those are explicitly added as
 // "dependencies" in package.json. Bundling them anyway could result in bugs
 // like https://github.com/mozilla/web-ext/issues/1629
-Object.keys(require('./package.json').dependencies)
-  .forEach(function(mod) {
-    nodeModules[mod] = 'commonjs ' + mod;
-  });
+var nodeExternals = require('webpack-node-externals');
 
 var rules = [
   {
     exclude: /(node_modules|bower_components)/,
     test: /\.js$/,
     // babel options are in .babelrc
-    loaders: ['babel-loader'],
+    loader: 'babel-loader',
   },
 ];
 
@@ -35,11 +29,25 @@ module.exports = {
     path: path.join(__dirname, 'dist'),
     filename: 'web-ext.js',
     libraryTarget: 'commonjs2',
+    // Force webpack bundled module to export the content
+    // of the default export.
+    libraryExport: 'default',
   },
   module: {
     rules,
   },
-  externals: nodeModules,
+  externals: [
+    nodeExternals({
+      modulesFromFile: {
+        // We shouldn't bundle devDependencies. E.g. git-rev-sync would be
+        // bundled if we omitted "devDependencies" from this list, which is
+        // undesired because the branch is never reached on production, so it
+        // is intentionally part of devDependencies to avoid the unnecessary
+        // dependency and bundling on production.
+        excludeFromBundle: ['dependencies', 'devDependencies'],
+      },
+    }),
+  ],
   plugins: [
     new webpack.BannerPlugin({
       banner: 'require("source-map-support").install();',
@@ -48,7 +56,7 @@ module.exports = {
     }),
     // This seems necessary to work with the 'when' module, which is
     // required by some things such as fx-runner.
-    new webpack.IgnorePlugin(/vertx/),
+    new webpack.IgnorePlugin({ resourceRegExp: /vertx/ }),
     // Global variables are necessary to print either verson number or
     // git commit information for custom builds
     new webpack.DefinePlugin({
@@ -62,5 +70,5 @@ module.exports = {
       path.resolve(__dirname, 'node_modules'),
     ],
   },
-  devtool: 'sourcemap',
+  devtool: 'source-map',
 };

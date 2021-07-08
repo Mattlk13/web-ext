@@ -74,7 +74,7 @@ function prepareExtensionRunnerParams({
   });
   remoteFirefox.client = fakeRemoteFirefoxClient;
 
-  // $FLOW_IGNORE: allow overriden params for testing purpose.
+  // $FlowIgnore: allow overriden params for testing purpose.
   const runnerParams: FirefoxAndroidExtensionRunnerParams = {
     extensions: [{
       sourceDir: '/fake/sourceDir',
@@ -95,6 +95,7 @@ function prepareExtensionRunnerParams({
       return Promise.resolve(remoteFirefox);
     }),
     desktopNotifications: sinon.spy(() => {}),
+    // $FlowIgnore: Allow to mock stdin with an EventEmitter for testing purpose.
     stdin: new EventEmitter(),
     ...(params || {}),
   };
@@ -113,6 +114,8 @@ function prepareSelectedDeviceAndAPKParams(
     ])),
     discoverInstalledFirefoxAPKs: sinon.spy(() => Promise.resolve([
       'org.mozilla.fennec', 'org.mozilla.firefox',
+      'org.mozilla.fenix', 'org.mozilla.fenix.nightly',
+      'org.mozilla.reference.browser',
     ])),
     getAndroidVersionNumber: sinon.spy(() => Promise.resolve(20)),
     amForceStopAPK: sinon.spy(() => Promise.resolve()),
@@ -127,6 +130,7 @@ function prepareSelectedDeviceAndAPKParams(
     startFirefoxAPK: sinon.spy(() => Promise.resolve()),
     setupForward: sinon.spy(() => Promise.resolve()),
     clearArtifactsDir: sinon.spy(() => Promise.resolve()),
+    detectOrRemoveOldArtifacts: sinon.spy(() => Promise.resolve(true)),
     setUserAbortDiscovery: sinon.spy(() => {}),
     ensureRequiredAPKRuntimePermissions: sinon.spy(() => Promise.resolve()),
     ...adbOverrides,
@@ -336,12 +340,15 @@ describe('util/extension-runners/firefox-android', () => {
 
          sinon.assert.calledWithMatch(
            fakeADBUtils.amForceStopAPK,
-           'emulator-1', 'org.mozilla.firefox'
+           'emulator-1',
+           'org.mozilla.firefox'
          );
 
          sinon.assert.calledWithMatch(
            fakeADBUtils.startFirefoxAPK,
-           'emulator-1', 'org.mozilla.firefox',
+           'emulator-1',
+           'org.mozilla.firefox',
+           undefined,
            runnerInstance.getDeviceProfileDir()
          );
 
@@ -350,6 +357,107 @@ describe('util/extension-runners/firefox-android', () => {
            fakeADBUtils.startFirefoxAPK
          );
        });
+
+    it('does check for existing artifacts dirs', async () => {
+      const adbOverrides = {
+        getOrCreateArtifactsDir: sinon.spy(
+          () => Promise.resolve('/data/local/tmp/web-ext-dir')
+        ),
+        detectOrRemoveOldArtifacts: sinon.spy(() => Promise.resolve(false)),
+      };
+      const overriddenProperties = {
+        params: {
+          adbDevice: 'emulator-1',
+          firefoxApk: 'org.mozilla.firefox',
+          buildSourceDir: sinon.spy(() => Promise.resolve({
+            extensionPath: fakeBuiltExtensionPath,
+          })),
+          adbRemoveOldArtifacts: false,
+        },
+      };
+      const {
+        params, fakeADBUtils,
+      } = prepareSelectedDeviceAndAPKParams(
+        overriddenProperties, adbOverrides
+      );
+
+      const runnerInstance = new FirefoxAndroidExtensionRunner(params);
+      await runnerInstance.run();
+
+      sinon.assert.calledWithMatch(
+        fakeADBUtils.detectOrRemoveOldArtifacts,
+        'emulator-1',
+        false,
+      );
+
+      // Ensure the old artifacts are checked or removed after stopping the
+      // apk and before creating the new artifacts dir.
+      sinon.assert.callOrder(
+        fakeADBUtils.amForceStopAPK,
+        fakeADBUtils.detectOrRemoveOldArtifacts,
+        fakeADBUtils.getOrCreateArtifactsDir
+      );
+    });
+
+    it('does optionally remove older artifacts dirs', async () => {
+      const adbOverrides = {
+        getOrCreateArtifactsDir: sinon.spy(
+          () => Promise.resolve('/data/local/tmp/web-ext-dir')
+        ),
+        detectOrRemoveOldArtifacts: sinon.spy(() => Promise.resolve(true)),
+      };
+      const overriddenProperties = {
+        params: {
+          adbDevice: 'emulator-1',
+          firefoxApk: 'org.mozilla.firefox',
+          buildSourceDir: sinon.spy(() => Promise.resolve({
+            extensionPath: fakeBuiltExtensionPath,
+          })),
+          adbRemoveOldArtifacts: true,
+        },
+      };
+      const {
+        params, fakeADBUtils,
+      } = prepareSelectedDeviceAndAPKParams(
+        overriddenProperties, adbOverrides
+      );
+
+      const runnerInstance = new FirefoxAndroidExtensionRunner(params);
+      await runnerInstance.run();
+
+      sinon.assert.calledWithMatch(
+        fakeADBUtils.detectOrRemoveOldArtifacts,
+        'emulator-1',
+        true,
+      );
+
+      // Ensure the old artifacts are checked or removed after stopping the
+      // apk and before creating the new artifacts dir.
+      sinon.assert.callOrder(
+        fakeADBUtils.amForceStopAPK,
+        fakeADBUtils.detectOrRemoveOldArtifacts,
+        fakeADBUtils.getOrCreateArtifactsDir
+      );
+    });
+
+    it('does run a specific apk component if specific', async () => {
+      const {
+        params, fakeADBUtils,
+      } = prepareSelectedDeviceAndAPKParams();
+
+      const runnerInstance = new FirefoxAndroidExtensionRunner({
+        ...params,
+        firefoxApkComponent: 'CustomView',
+      });
+      await runnerInstance.run();
+      sinon.assert.calledWithMatch(
+        fakeADBUtils.startFirefoxAPK,
+        'emulator-1',
+        'org.mozilla.firefox',
+        'CustomView',
+        runnerInstance.getDeviceProfileDir()
+      );
+    });
 
     it('supports custom prefs via --pref', async () => {
       const fakeFirefoxApp = {
@@ -681,7 +789,7 @@ describe('util/extension-runners/firefox-android', () => {
            return Promise.reject(new WebExtError('fake timeout'));
          });
 
-         params.firefoxAndroidTimeout = 0;
+         params.adbDiscoveryTimeout = 0;
 
          let actualError;
 
@@ -906,11 +1014,9 @@ describe('util/extension-runners/firefox-android', () => {
       ];
 
       for (const testCase of optionsWarningTestCases) {
-        // $FLOW_IGNORE: allow overriden params for testing purpose.
-        new FirefoxAndroidExtensionRunner({ // eslint-disable-line no-new
-          ...params,
-          ...(testCase.params),
-        });
+        const runnerOptions = {...params, ...(testCase.params)};
+        // $FlowIgnore: allow use of inexact object literal for testing purpose.
+        new FirefoxAndroidExtensionRunner(runnerOptions); // eslint-disable-line no-new
 
         assert.match(
           consoleStream.capturedMessages[0],

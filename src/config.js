@@ -54,7 +54,7 @@ export function applyConfigToArgv({
       continue;
     }
 
-    const decamelizedOptName = decamelize(option, '-');
+    const decamelizedOptName = decamelize(option, {separator: '-'});
 
     if (typeof options[decamelizedOptName] !== 'object') {
       throw new UsageError(`The config file at ${configFileName} specified ` +
@@ -113,6 +113,8 @@ export function applyConfigToArgv({
         `Calling coerce() on configured value for ${option}`);
       newArgv[option] = coerce(newArgv[option]);
     }
+
+    newArgv[decamelizedOptName] = newArgv[option];
   }
   return newArgv;
 }

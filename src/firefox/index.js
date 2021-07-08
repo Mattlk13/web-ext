@@ -4,8 +4,7 @@ import path from 'path';
 import {promisify} from 'util';
 
 import {default as defaultFxRunner} from 'fx-runner';
-import FirefoxProfile, {copyFromUserProfile as defaultUserProfileCopier}
-  from 'firefox-profile';
+import FirefoxProfile from 'firefox-profile';
 import {fs} from 'mz';
 import eventToPromise from 'event-to-promise';
 
@@ -26,7 +25,9 @@ import type {ExtensionManifest} from '../util/manifest';
 
 const log = createLogger(__filename);
 
-const defaultAsyncFsStat = fs.stat.bind(fs);
+const defaultAsyncFsStat: typeof fs.stat = fs.stat.bind(fs);
+
+const defaultUserProfileCopier = FirefoxProfile.copyFromUserProfile;
 
 export const defaultFirefoxEnv = {
   XPCOM_DEBUG_BREAK: 'stack',
@@ -50,7 +51,9 @@ export type FirefoxRunnerParams = {|
   'listen': number,
   'binary-args'?: Array<string> | string,
   'env'?: {
-    [key: string]: string
+    // This match the flowtype signature for process.env (and prevent flow
+    // from complaining about differences between their type signature)
+    [key: string]: string | void
   },
   'verbose'?: boolean,
 |};

@@ -4,8 +4,11 @@ import path from 'path';
 import {readFileSync} from 'fs';
 
 import camelCase from 'camelcase';
-import git from 'git-rev-sync';
+import decamelize from 'decamelize';
 import yargs from 'yargs';
+// TODO(rpl): try to remove the following suppress comment after updating flow to more recent versions.
+// $FlowFixMe: flow doesn't seem to read yet the `exports` property from the yargs package.json.
+import { Parser as yargsParser } from 'yargs/yargs';
 
 import defaultCommands from './cmd';
 import {UsageError} from './errors';
@@ -53,6 +56,7 @@ export class Program {
   shouldExitProgram: boolean;
   verboseEnabled: boolean;
   options: Object;
+  programArgv: Array<string>;
 
   constructor(
     argv: ?Array<string>,
@@ -65,6 +69,7 @@ export class Program {
     // NOTE: process.argv.slice(2) removes the path to node and web-ext
     // executables from the process.argv array.
     argv = argv || process.argv.slice(2);
+    this.programArgv = argv;
 
     // NOTE: always initialize yargs explicitly with the package dir
     // to avoid side-effects due to yargs looking for its configuration
@@ -78,13 +83,11 @@ export class Program {
     this.absolutePackageDir = absolutePackageDir;
     this.verboseEnabled = false;
     this.shouldExitProgram = true;
+
     this.yargs = yargsInstance;
-
-    // The following yargs configuration option is needed to fix #304.
     this.yargs.parserConfiguration({
-      'boolean-negation': false,
+      'boolean-negation': true,
     });
-
     this.yargs.strict();
 
     this.commands = {};
@@ -148,6 +151,90 @@ export class Program {
     this.verboseEnabled = true;
   }
 
+  // Retrieve the yargs argv object and apply any further fix needed
+  // on the output of the yargs options parsing.
+  getArguments(): Object {
+    // To support looking up required parameters via config files, we need to
+    // temporarily disable the requiredArguments validation. Otherwise yargs
+    // would exit early. Validation is enforced by the checkRequiredArguments()
+    // method, after reading configuration files.
+    //
+    // This is an undocumented internal API of yargs! Unit tests to avoid
+    // regressions are located at: tests/functional/test.cli.sign.js
+    //
+    // Replace hack if possible:  https://github.com/mozilla/web-ext/issues/1930
+    const validationInstance = this.yargs.getValidationInstance();
+    const { requiredArguments } = validationInstance;
+    validationInstance.requiredArguments = () => {};
+    const argv = this.yargs.argv;
+    validationInstance.requiredArguments = requiredArguments;
+
+    // Yargs boolean options doesn't define the no* counterpart
+    // with negate-boolean on Yargs 15. Define as expected by the
+    // web-ext execute method.
+    if (argv.configDiscovery != null) {
+      argv.noConfigDiscovery = !argv.configDiscovery;
+    }
+    if (argv.reload != null) {
+      argv.noReload = !argv.reload;
+    }
+
+    // Yargs doesn't accept --no-input as a valid option if there isn't a
+    // --input option defined to be negated, to fix that the --input is
+    // defined and hidden from the yargs help output and we define here
+    // the negated argument name that we expect to be set in the parsed
+    // arguments (and fix https://github.com/mozilla/web-ext/issues/1860).
+    if (argv.input != null) {
+      argv.noInput = !argv.input;
+    }
+
+    // Replacement for the "requiresArg: true" parameter until the following bug
+    // is fixed: https://github.com/yargs/yargs/issues/1098
+    if (argv.ignoreFiles && !argv.ignoreFiles.length) {
+      throw new UsageError('Not enough arguments following: ignore-files');
+    }
+
+    if (argv.startUrl && !argv.startUrl.length) {
+      throw new UsageError('Not enough arguments following: start-url');
+    }
+
+    return argv;
+  }
+
+  // getArguments() disables validation of required parameters, to allow us to
+  // read parameters from config files first. Before the program continues, it
+  // must call checkRequiredArguments() to ensure that required parameters are
+  // defined (in the CLI or in a config file).
+  checkRequiredArguments(adjustedArgv: Object): void {
+    const validationInstance = this.yargs.getValidationInstance();
+    validationInstance.requiredArguments(adjustedArgv);
+  }
+
+  // Remove WEB_EXT_* environment vars that are not a global cli options
+  // or an option supported by the current command (See #793).
+  cleanupProcessEnvConfigs(systemProcess: typeof process) {
+    const cmd = yargsParser(this.programArgv)._[0];
+    const env = systemProcess.env || {};
+    const toOptionKey = (k) => decamelize(
+      camelCase(k.replace(envPrefix, '')), {separator: '-'}
+    );
+
+    if (cmd) {
+      Object.keys(env)
+        .filter((k) => k.startsWith(envPrefix))
+        .forEach((k) => {
+          const optKey = toOptionKey(k);
+          const globalOpt = this.options[optKey];
+          const cmdOpt = this.options[cmd] && this.options[cmd][optKey];
+
+          if (!globalOpt && !cmdOpt) {
+            log.debug(`Environment ${k} not supported by web-ext ${cmd}`);
+            delete env[k];
+          }
+        });
+    }
+  }
+
   async execute(
     {
       checkForUpdates = defaultUpdateChecker,
@@ -164,13 +251,8 @@ export class Program {
     this.shouldExitProgram = shouldExitProgram;
     this.yargs.exitProcess(this.shouldExitProgram);
 
-    const argv = this.yargs.argv;
-
-    // Replacement for the "requiresArg: true" parameter until the following bug
-    // is fixed: https://github.com/yargs/yargs/issues/1098
-    if (argv.ignoreFiles && !argv.ignoreFiles.length) {
-      throw new UsageError('Not enough arguments following: ignore-files');
-    }
+    this.cleanupProcessEnvConfigs(systemProcess);
+    const argv = this.getArguments();
 
     const cmd = argv._[0];
 
@@ -196,10 +278,7 @@ export class Program {
 
       const configFiles = [];
 
-      // Because of an issue with yargs special handling for '--no-' option prefix (See #306)
-      // we need to look explicitly for the options  --config-discovery and --no-config-discovery
-      // (See #1307).
-      if (argv.configDiscovery && !argv.noConfigDiscovery) {
+      if (argv.configDiscovery) {
         log.debug(
           'Discovering config files. ' +
           'Set --no-config-discovery to disable');
@@ -239,6 +318,8 @@ export class Program {
         // Ensure that the verbose is enabled when specified in a config file.
         this.enableVerboseMode(logStream, version);
       }
+
+      this.checkRequiredArguments(adjustedArgv);
 
       await runCommand(adjustedArgv, {shouldExitProgram});
 
@@ -282,6 +363,11 @@ export function defaultVersionGetter(
     return JSON.parse(packageData).version;
   } else {
     log.debug('Getting version from the git revision');
+    // This branch is only reached during development.
+    // git-rev-sync is in devDependencies, and lazily imported using require.
+    // This also avoids logspam from https://github.com/mozilla/web-ext/issues/1916
+    // eslint-disable-next-line import/no-extraneous-dependencies
+    const git = require('git-rev-sync');
     return `${git.branch(absolutePackageDir)}-${git.long(absolutePackageDir)}`;
   }
 }
@@ -293,6 +379,15 @@ type MainParams = {
   commands?: Object,
   argv: Array<any>,
   runOptions?: Object,
+}
+
+export function throwUsageErrorIfArray(errorMessage: string): any {
+  return (value: any): any => {
+    if (Array.isArray(value)) {
+      throw new UsageError(errorMessage);
+    }
+    return value;
+  };
 }
 
 export function main(
@@ -366,6 +461,13 @@ Example: $0 --help run.
       type: 'boolean',
       demandOption: false,
     },
+    'input': {
+      // This option is defined to make yargs to accept the --no-input
+      // defined above, but we hide it from the yargs help output.
+      hidden: true,
+      type: 'boolean',
+      demandOption: false,
+    },
     'config': {
       alias: 'c',
       describe: 'Path to a CommonJS config file to set ' +
@@ -393,6 +495,18 @@ Example: $0 --help run.
           describe: 'Watch for file changes and re-build as needed',
           type: 'boolean',
         },
+        'filename': {
+          alias: 'n',
+          describe: 'Name of the created extension package file.',
+          default: undefined,
+          normalize: false,
+          demandOption: false,
+          requiresArg: true,
+          type: 'string',
+          coerce: throwUsageErrorIfArray(
+            'Multiple --filename/-n option are not allowed'
+          ),
+        },
         'overwrite-dest': {
           alias: 'o',
           describe: 'Overwrite destination package if it exists.',
@@ -415,7 +529,7 @@ Example: $0 --help run.
         },
         'api-url-prefix': {
           describe: 'Signing API URL prefix',
-          default: 'https://addons.mozilla.org/api/v3',
+          default: 'https://addons.mozilla.org/api/v4',
           demandOption: true,
           type: 'string',
         },
@@ -484,16 +598,40 @@ Example: $0 --help run.
         demandOption: false,
         type: 'string',
       },
+      'profile-create-if-missing': {
+        describe: 'Create the profile directory if it does not already exist',
+        demandOption: false,
+        type: 'boolean',
+      },
       'keep-profile-changes': {
         describe: 'Run Firefox directly in custom profile. Any changes to ' +
                   'the profile will be saved.',
         demandOption: false,
         type: 'boolean',
       },
-      'no-reload': {
-        describe: 'Do not reload the extension when source files change',
+      'reload': {
+        describe: 'Reload the extension when source files change.' +
+          'Disable with --no-reload.',
         demandOption: false,
+        default: true,
         type: 'boolean',
+      },
+      'watch-file': {
+        alias: ['watch-files'],
+        describe: 'Reload the extension only when the contents of this' +
+                  ' file changes. This is useful if you use a custom' +
+                  ' build process for your extension',
+        demandOption: false,
+        type: 'array',
+      },
+      'watch-ignored': {
+        describe: 'Paths and globs patterns that should not be ' +
+                  'watched for changes. This is useful if you want ' +
+                  'to explicitly prevent web-ext from watching part ' +
+                  'of the extension directory tree, ' +
+                  'e.g. the node_modules folder.',
+        demandOption: false,
+        type: 'array',
       },
       'pre-install': {
         describe: 'Pre-install the extension into the profile before ' +
@@ -516,7 +654,6 @@ Example: $0 --help run.
         alias: ['u', 'url'],
         describe: 'Launch firefox at specified page',
         demandOption: false,
-        requiresArg: true,
         type: 'array',
       },
       'browser-console': {
@@ -557,11 +694,29 @@ Example: $0 --help run.
         type: 'string',
         requiresArg: true,
       },
+      'adb-discovery-timeout': {
+        describe: 'Number of milliseconds to wait before giving up',
+        demandOption: false,
+        type: 'number',
+        requiresArg: true,
+      },
+      'adb-remove-old-artifacts': {
+        describe: 'Remove old artifacts directories from the adb device',
+        demandOption: false,
+        type: 'boolean',
+      },
       'firefox-apk': {
         describe: (
           'Run a specific Firefox for Android APK. ' +
           'Example: org.mozilla.fennec_aurora'
         ),
+        demandOption: false,
+        type: 'string',
+        requiresArg: true,
+      },
+      'firefox-apk-component': {
+        describe:
+          'Run a specific Android Component (defaults to <firefox-apk>/.App)',
         demandOption: false,
         type: 'string',
         requiresArg: true,

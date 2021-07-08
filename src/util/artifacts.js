@@ -1,16 +1,13 @@
 /* @flow */
-import {promisify} from 'util';
-
 import {fs} from 'mz';
-import mkdirp from 'mkdirp';
+import defaultAsyncMkdirp from 'mkdirp';
 
 import {UsageError, isErrorWithCode} from '../errors';
 import {createLogger} from './logger';
 
 const log = createLogger(__filename);
 
-const defaultAsyncMkdirp = promisify(mkdirp);
-const defaultAsyncFsAccess = fs.access.bind(fs);
+const defaultAsyncFsAccess: typeof fs.access = fs.access.bind(fs);
 
 type PrepareArtifactsDirOptions = {
   asyncMkdirp?: typeof defaultAsyncMkdirp,

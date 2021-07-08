@@ -2,7 +2,7 @@
 import path from 'path';
 
 import {fs} from 'mz';
-import defaultAddonSigner from 'sign-addon';
+import {signAddon as defaultAddonSigner} from 'sign-addon';
 
 import defaultBuilder from './build';
 import getValidatedManifest, {getManifestId} from '../util/manifest';
@@ -15,7 +15,8 @@ import type {ExtensionManifest} from '../util/manifest';
 
 const log = createLogger(__filename);
 
-const defaultAsyncFsReadFile = fs.readFile.bind(fs);
+const defaultAsyncFsReadFile: (string) => Promise<Buffer> =
+  fs.readFile.bind(fs);
 
 export const extensionIdFile = '.web-extension-id';
 

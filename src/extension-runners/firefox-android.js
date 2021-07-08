@@ -70,8 +70,10 @@ export type FirefoxAndroidExtensionRunnerParams = {|
   adbHost?: string,
   adbPort?: string,
   adbDevice?: string,
+  adbDiscoveryTimeout?: number,
+  adbRemoveOldArtifacts?: boolean,
   firefoxApk?: string,
-  firefoxAndroidTimeout?: number,
+  firefoxApkComponent?: string,
 
   // Injected Dependencies.
   firefoxApp: typeof defaultFirefoxApp,
@@ -87,9 +89,9 @@ export type FirefoxAndroidExtensionRunnerParams = {|
  */
 export class FirefoxAndroidExtensionRunner {
   // Wait 3s before the next unix socket discovery loop.
-  static unixSocketDiscoveryRetryInterval = 3 * 1000;
+  static unixSocketDiscoveryRetryInterval: number = 3 * 1000;
   // Wait for at most 3 minutes before giving up.
-  static unixSocketDiscoveryMaxTime = 3 * 60 * 1000;
+  static unixSocketDiscoveryMaxTime: number = 3 * 60 * 1000;
 
   params: FirefoxAndroidExtensionRunnerParams;
   adbUtils: DefaultADBUtils;
@@ -141,7 +143,10 @@ export class FirefoxAndroidExtensionRunner {
     // pretty slow, we can run the following 3 steps in parallel to speed up
     // it a bit.
     await Promise.all([
-      // Start Firefox for Android instance on the created profile.
+      // Start Firefox for Android instance if not started yet.
+      // (Fennec would run in an temporary profile and so it is explicitly
+      // stopped, Fenix runs on its usual profile and so it may be already
+      // running).
       this.adbStartSelectedPackage(),
 
       // Build and push to devices all the extension xpis
@@ -163,7 +168,7 @@ export class FirefoxAndroidExtensionRunner {
   /**
    * Returns the runner name.
    */
-  getName() {
+  getName(): string {
     return 'Firefox Android';
   }
 
@@ -409,11 +414,13 @@ export class FirefoxAndroidExtensionRunner {
     // Runtime permission needed to be able to run Firefox on a temporarily created profile
     // on android versions >= 23 (Android Marshmallow, which is the first version where
     // these permissions are optional and have to be granted explicitly).
+    const requiredPermissions = [
+      'android.permission.READ_EXTERNAL_STORAGE',
+      'android.permission.WRITE_EXTERNAL_STORAGE',
+    ];
+
     await adbUtils.ensureRequiredAPKRuntimePermissions(
-      selectedAdbDevice, selectedFirefoxApk, [
-        'android.permission.READ_EXTERNAL_STORAGE',
-        'android.permission.WRITE_EXTERNAL_STORAGE',
-      ]
+      selectedAdbDevice, selectedFirefoxApk, requiredPermissions
     );
   }
 
@@ -425,6 +432,7 @@ export class FirefoxAndroidExtensionRunner {
       params: {
         customPrefs,
         firefoxApp,
+        adbRemoveOldArtifacts,
       },
     } = this;
     // Create the preferences file and the Fennec temporary profile.
@@ -434,6 +442,24 @@ export class FirefoxAndroidExtensionRunner {
       app: 'fennec',
       customPrefs,
     });
+
+    // Check if there are any artifacts dirs from previous runs and
+    // automatically remove them if adbRemoteOldArtifacts is true.
+    const foundOldArtifacts = await adbUtils.detectOrRemoveOldArtifacts(
+      selectedAdbDevice, adbRemoveOldArtifacts
+    );
+
+    if (foundOldArtifacts) {
+      if (adbRemoveOldArtifacts) {
+        log.info('Old web-ext artifacts have been found and removed ' +
+          `from ${selectedAdbDevice} device`);
+      } else {
+        log.warn(
+          `Old artifacts directories have been found on ${selectedAdbDevice} ` +
+          'device. Use --adb-remove-old-artifacts to remove them automatically.'
+        );
+      }
+    }
 
     // Choose a artifacts dir name for the assets pushed to the
     // Android device.
@@ -458,16 +484,22 @@ export class FirefoxAndroidExtensionRunner {
       adbUtils,
       selectedFirefoxApk,
       selectedAdbDevice,
+      params: {
+        firefoxApkComponent,
+      },
     } = this;
 
     const deviceProfileDir = this.getDeviceProfileDir();
 
     log.info(`Starting ${selectedFirefoxApk}...`);
 
-    log.debug(`Using profile ${deviceProfileDir}`);
+    log.debug(`Using profile ${deviceProfileDir} (ignored by Fenix)`);
 
     await adbUtils.startFirefoxAPK(
-      selectedAdbDevice, selectedFirefoxApk, deviceProfileDir
+      selectedAdbDevice,
+      selectedFirefoxApk,
+      firefoxApkComponent,
+      deviceProfileDir,
     );
   }
 
@@ -516,7 +548,7 @@ export class FirefoxAndroidExtensionRunner {
       selectedAdbDevice,
       selectedFirefoxApk,
       params: {
-        firefoxAndroidTimeout,
+        adbDiscoveryTimeout,
       },
     } = this;
 
@@ -530,8 +562,8 @@ export class FirefoxAndroidExtensionRunner {
       unixSocketDiscoveryMaxTime,
     } = FirefoxAndroidExtensionRunner;
 
-    if (typeof firefoxAndroidTimeout === 'number') {
-      unixSocketDiscoveryMaxTime = firefoxAndroidTimeout;
+    if (typeof adbDiscoveryTimeout === 'number') {
+      unixSocketDiscoveryMaxTime = adbDiscoveryTimeout;
     }
 
     const handleCtrlC = (str, key) => {
